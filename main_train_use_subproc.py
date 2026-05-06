@@ -59,50 +59,50 @@ def log_info(msg: str):
 
 ACTION_CONCENTRATIONS: tuple[int, ...] = (0, 500, 1000, 1500)
 
-TVOC_EXCESS_NORM = 17.5
-CO2_EXCESS_NORM = 144.0
-THI_EXCESS_NORM = 0.045
-RH_EXCESS_NORM = 5.75
+TVOC_EXCESS_NORM = 20.0
+THI_EXCESS_NORM = 0.040
+RH_EXCESS_NORM = 6.25
 COLD_EXCESS_NORM = 0.040
-TVOC_PROGRESS_NORM = 4.75
-CO2_PROGRESS_NORM = 16.2
+TVOC_PROGRESS_NORM = 5.0
+
+TVOC_OBS_DIVISOR = 1.0
+CO2_OBS_DIVISOR = 1.0
+TEMP_OBS_DIVISOR = 1.0
+RH_OBS_MIN = 0.0
+RH_OBS_SPAN = 1.0
 
 AlgoName = Literal["ppo", "dqn"]
 
 
 @dataclass(frozen=True)
 class RewardWeights:
-    tvoc_excess_scale: float = 1.2
-    tvoc_progress_scale: float = 1.0
+    tvoc_excess_scale: float = 1.0
     use_tvoc_delta: bool = True
     tvoc_target: float = 50.0
-
-    co2_excess_scale: float = 0.6
-    co2_progress_scale: float = 0.4
-    use_co2_delta: bool = True
-    co2_target: float = 400.0
 
     thi_scale: float = 0.45
     rh_excess_scale: float = 0.15
     rh_target: float = 90.0
     cold_scale: float = 0.30
 
-    action_scale: float = 0.9
-    action_curve_power: float = 1.5
-    action_urgency_scale: float = 1.5
+    action_scale: float = 1.0
+    action_curve_power: float = 3
+    action_urgency_scale: float = 1.0
 
 
 @dataclass
 class Pi1SimulatorConfig:
     gamma: float = 0.99
     baseline_decay_frac_per_step: float = 0.40
-    co2_baseline_decay_frac_per_step: float = 0.40
     time_step_minutes: float = 5.0
     spray_volume_ml: float = 1000.0
-    alpha_tvoc: float = 0.0005
-    alpha_rh: float = 0.0005
-    alpha_temp: float = 0.0005
-    alpha_co2: float = 0.00002
+    spray_mass_kg: float = 1.0
+    room_area_m2: float = 400.0
+    room_height_m: float = 3.0
+    room_volume_m3: float = room_area_m2 * room_height_m
+    room_total_air_mass_kg: float = room_volume_m3 * 1.176
+    atmospheric_pressure_pa: float = 101325.0
+    cp_air: float = 1.005
     tvoc_noise_sigma: float = 2.35
     rh_noise_sigma: float = 0.10
     co2_noise_sigma: float = 4.92
@@ -127,11 +127,11 @@ class EnvConfig:
     reward: RewardWeights = field(default_factory=RewardWeights)
     max_steps: int = 250
     gamma: float = 0.99
-    tvoc_norm_divisor: float = 1.0
-    co2_norm_divisor: float = 1.0
-    temp_norm_divisor: float = 1.0
-    rh_min: float = 0.0
-    rh_span: float = 1.0
+    tvoc_norm_divisor: float = field(default_factory=lambda: TVOC_OBS_DIVISOR)
+    co2_norm_divisor: float = field(default_factory=lambda: CO2_OBS_DIVISOR)
+    temp_norm_divisor: float = field(default_factory=lambda: TEMP_OBS_DIVISOR)
+    rh_min: float = field(default_factory=lambda: RH_OBS_MIN)
+    rh_span: float = field(default_factory=lambda: RH_OBS_SPAN)
 
 
 # ==============================================================================
@@ -150,8 +150,21 @@ def wetbulb_stull(temp_c: float, rh: float) -> float:
     )
 
 
+def tetens_saturation_vapor_pressure(temp_c: float) -> float:
+    """Calculate saturation vapor pressure in hPa using Tetens formula."""
+
+    return 6.1078 * np.exp((17.27 * temp_c) / (temp_c + 237.3))
+
+
+def tvoc_spray_loss(dose_mg_L: float) -> float:
+    """Simple model for TVOC reduction from spray dose."""
+
+    beta = -np.log(1 - 0.649) / 1500.0
+    return 1 - np.exp(-beta * dose_mg_L)
+
+
 class Pi1SpraySimulator:
-    """Mechanistic simulator for RL prototyping on pi-1 5-minute data."""
+    """Hybrid reduced-order simulator for RL prototyping on pi-1 5-minute data."""
 
     def __init__(
         self,
@@ -174,23 +187,6 @@ class Pi1SpraySimulator:
         self.real_rh = base["humidity"].to_numpy(dtype=float)
         self.T = len(base)
 
-        # Inverse Box Model: Recover latent emissions from real data
-        self.emission = np.empty(self.T, dtype=float)
-        self.emission[:-1] = (
-            self.real_tvoc[1:]
-            - self.real_tvoc[:-1]
-            + self.cfg.baseline_decay_frac_per_step * self.real_tvoc[:-1]
-        )
-        self.emission[-1] = self.emission[-2]
-
-        self.co2_emission = np.empty(self.T, dtype=float)
-        self.co2_emission[:-1] = (
-            self.real_co2[1:]
-            - self.real_co2[:-1]
-            + self.cfg.co2_baseline_decay_frac_per_step * self.real_co2[:-1]
-        )
-        self.co2_emission[-1] = self.co2_emission[-2]
-
     @staticmethod
     def action_space() -> list[int]:
         return list(ACTION_CONCENTRATIONS)
@@ -209,51 +205,68 @@ class Pi1SpraySimulator:
 
     def step(self, state: np.ndarray, action: int, t: int) -> np.ndarray:
         t = int(np.clip(t, 0, self.T - 2))
-        tvoc_current = float(state[0])
-        co2_current = float(state[1])
-
-        spray_volume_L = self.cfg.spray_volume_ml / 1000.0
-        dose_mg = float(action) * spray_volume_L
-
-        k_base = (
-            -np.log(1.0 - self.cfg.baseline_decay_frac_per_step)
-            / self.cfg.time_step_minutes
-        )
-        tvoc_spray_loss = self.cfg.alpha_tvoc * dose_mg * tvoc_current
+        tvoc_base = self.real_tvoc[t + 1]
+        beta = -np.log(1 - 0.649) / 1500.0
         tvoc_next = (
-            tvoc_current * np.exp(-k_base * self.cfg.time_step_minutes)
-            + self.emission[t]
-            - tvoc_spray_loss
-        )
-        tvoc_next = max(
-            0.0, tvoc_next + self.rng.normal(0.0, self.cfg.tvoc_noise_sigma)
+            tvoc_base
+            - (1 - np.exp(-beta * action)) * tvoc_base
+            + self.rng.normal(0.0, self.cfg.tvoc_noise_sigma)
         )
 
-        k_co2_base = (
-            -np.log(1.0 - self.cfg.co2_baseline_decay_frac_per_step)
-            / self.cfg.time_step_minutes
-        )
-        k_co2_spray = self.cfg.alpha_co2 * dose_mg
-        k_co2_total = k_co2_base + k_co2_spray
-        co2_next = (
-            co2_current * np.exp(-k_co2_total * self.cfg.time_step_minutes)
-            + self.co2_emission[t]
-        )
-        co2_next = max(300.0, co2_next + self.rng.normal(0.0, self.cfg.co2_noise_sigma))
+        co2_base = self.real_co2[t + 1]
+        co2_next = co2_base + self.rng.normal(0.0, self.cfg.co2_noise_sigma)
+        co2_next = max(300.0, co2_next)
+
+        if action == 0:
+            temp_next = self.real_temp[t + 1] + self.rng.normal(
+                0.0, self.cfg.temp_noise_sigma
+            )
+            rh_next = self.real_rh[t + 1] + self.rng.normal(
+                0.0, self.cfg.rh_noise_sigma
+            )
+            rh_next = np.clip(rh_next, 0.0, 100.0)
+            return np.array([tvoc_next, co2_next, temp_next, rh_next], dtype=float)
 
         rh_base = self.real_rh[t + 1]
         temp_base = self.real_temp[t + 1]
 
-        rh_next = rh_base + self.cfg.alpha_rh * dose_mg * (100.0 - rh_base)
-        rh_next = rh_next + self.rng.normal(0.0, self.cfg.rh_noise_sigma)
-        rh_next = float(np.clip(rh_next, 0.0, 100.0))
-
         wetbulb = wetbulb_stull(temp_base, rh_base)
-        temp_drop = self.cfg.alpha_temp * dose_mg * (temp_base - wetbulb)
+        L = 2501 - (2.369 * temp_base)
+        temp_drop = (self.cfg.spray_mass_kg * L) / (
+            self.cfg.room_total_air_mass_kg * self.cfg.cp_air
+        )
         temp_next = max(
             wetbulb,
             temp_base - temp_drop + self.rng.normal(0.0, self.cfg.temp_noise_sigma),
         )
+
+        actual_liquid_evaporation = (
+            (temp_base - temp_next) * self.cfg.room_total_air_mass_kg * self.cfg.cp_air
+        ) / L
+
+        e_s_initial = tetens_saturation_vapor_pressure(temp_base)
+        e_initial = e_s_initial * (rh_base / 100.0)
+
+        w_initial = 0.622 * (
+            e_initial / (self.cfg.atmospheric_pressure_pa / 100.0 - e_initial)
+        )
+
+        w_added = actual_liquid_evaporation / self.cfg.room_total_air_mass_kg
+        w_final = w_initial + w_added
+
+        e_final = (w_final * self.cfg.atmospheric_pressure_pa / 100.0) / (
+            0.622 + w_final
+        )
+
+        e_s_final = tetens_saturation_vapor_pressure(temp_next)
+
+        rh_next = (e_final / e_s_final) * 100.0 + self.rng.normal(
+            0.0, self.cfg.rh_noise_sigma
+        )
+
+        rh_next = min(rh_next, 100.0)
+        if rh_next >= 99.5:
+            rh_next = 100.0
 
         return np.array([tvoc_next, co2_next, temp_next, rh_next], dtype=float)
 
@@ -276,9 +289,6 @@ class Pi1SpraySimulator:
         tvoc_excess = max(0.0, tvoc_next - w.tvoc_target) / TVOC_EXCESS_NORM
         tvoc_excess_term = -w.tvoc_excess_scale * tvoc_excess
 
-        co2_excess = max(0.0, co2_next - w.co2_target) / CO2_EXCESS_NORM
-        co2_excess_term = -w.co2_excess_scale * co2_excess
-
         thi_prev = (0.8 * temp_prev) + ((rh_prev / 100.0) * (temp_prev - 14.4)) + 46.4
         thi_next = (0.8 * temp_next) + ((rh_next / 100.0) * (temp_next - 14.4)) + 46.4
 
@@ -297,14 +307,7 @@ class Pi1SpraySimulator:
             -w.action_scale * (dose_norm**w.action_curve_power) * urgency_multiplier
         )
 
-        base_reward = (
-            tvoc_excess_term
-            + co2_excess_term
-            + thi_term
-            + rh_term
-            + cold_term
-            + action_term
-        )
+        base_reward = tvoc_excess_term + thi_term + rh_term + cold_term + action_term
 
         phi_prev = self._phi(tvoc_prev, co2_prev, temp_prev, rh_prev, w)
         phi_next = self._phi(tvoc_next, co2_next, temp_next, rh_next, w)
@@ -318,14 +321,12 @@ class Pi1SpraySimulator:
         thi = (0.8 * temp) + ((rh / 100.0) * (temp - 14.4)) + 46.4
 
         tvoc_excess = max(0.0, tvoc - w.tvoc_target) / TVOC_EXCESS_NORM
-        co2_excess = max(0.0, co2 - w.co2_target) / CO2_EXCESS_NORM
         thi_excess = max(0.0, thi - 73.0) / THI_EXCESS_NORM
         rh_excess = max(0.0, rh - w.rh_target) / RH_EXCESS_NORM
         cold_excess = max(0.0, 18.0 - temp) / COLD_EXCESS_NORM
 
         return -(
             w.tvoc_excess_scale * tvoc_excess
-            + w.co2_excess_scale * co2_excess
             + w.thi_scale * thi_excess
             + w.rh_excess_scale * rh_excess
             + w.cold_scale * cold_excess
@@ -438,16 +439,11 @@ class Pi1SprayEnv(gym.Env):
 ALGO_CLASSES = {"ppo": PPO, "dqn": DQN}
 
 
-def make_env_cfg(sim: Pi1SpraySimulator, gamma: float, obs_divisors: dict) -> EnvConfig:
+def make_env_cfg(sim: Pi1SpraySimulator, gamma: float) -> EnvConfig:
     return EnvConfig(
         reward=sim.cfg.reward,
-        max_steps=RLRunConfig.max_steps,
+        max_steps=250,
         gamma=gamma,
-        tvoc_norm_divisor=obs_divisors.get("tvoc", 1.0),
-        co2_norm_divisor=obs_divisors.get("co2", 1.0),
-        temp_norm_divisor=obs_divisors.get("temp", 1.0),
-        rh_min=obs_divisors.get("rh_min", 0.0),
-        rh_span=obs_divisors.get("rh_span", 1.0),
     )
 
 
@@ -595,7 +591,6 @@ def evaluate_model(
     temp_list: list[float] = []
     action_counts = {dose: 0 for dose in ACTION_CONCENTRATIONS}
     step_tvoc_hit = 0
-    step_co2_hit = 0
     step_count = 0
 
     for ep in range(n_episodes):
@@ -603,7 +598,6 @@ def evaluate_model(
         obs = eval_env.reset()
         tvoc_start = float(eval_env.get_attr("state")[0][0])
         ep_reward = 0.0
-        last_info = None
         done = [False]
 
         while not done[0]:
@@ -612,7 +606,6 @@ def evaluate_model(
 
             ep_reward += float(rewards[0])
             info = infos[0]
-            last_info = info
 
             dose = int(info["dose"])
             action_counts[dose] += 1
@@ -629,8 +622,6 @@ def evaluate_model(
 
             if tvoc <= env_cfg.reward.tvoc_target:
                 step_tvoc_hit += 1
-            if co2 <= env_cfg.reward.co2_target:
-                step_co2_hit += 1
             step_count += 1
 
         reward_list.append(ep_reward)
@@ -646,6 +637,7 @@ def evaluate_model(
     action_entropy = float(
         -(action_probs[action_probs > 0] * np.log(action_probs[action_probs > 0])).sum()
     )
+    dominant_action_ratio = float(action_probs.max())
 
     out = {
         "episodes": n_episodes,
@@ -659,8 +651,8 @@ def evaluate_model(
         "mean_co2": float(np.mean(co2_list)) if co2_list else np.nan,
         "mean_temp": float(np.mean(temp_list)) if temp_list else np.nan,
         "tvoc_target_hit_rate": step_tvoc_hit / max(1, step_count),
-        "co2_target_hit_rate": step_co2_hit / max(1, step_count),
         "action_entropy": action_entropy,
+        "dominant_action_ratio": dominant_action_ratio,
         **action_ratio,
     }
     return pd.DataFrame([out])
@@ -670,12 +662,11 @@ def tune_hyperparams(
     algo: AlgoName,
     base_sim: Pi1SpraySimulator,
     run_cfg: RLRunConfig,
-    obs_divisors: dict,
 ) -> dict:
     def objective(trial: optuna.Trial) -> float:
         params = finalize_params(sample_hyperparams(algo, trial))
         gamma = float(params.get("gamma", 0.99))
-        env_cfg = make_env_cfg(base_sim, gamma=gamma, obs_divisors=obs_divisors)
+        env_cfg = make_env_cfg(base_sim, gamma=gamma)
 
         train_env = build_vec_env(
             base_sim=base_sim,
@@ -769,36 +760,79 @@ def main():
     log_info(f"Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log_info("=" * 80)
 
-    # Load cleaned data
-    data_file = BASE_DIR / "pi-1-data-clean-5min.csv"
-    if not data_file.exists():
-        log_info(f"ERROR: {data_file} not found. Exiting.")
-        return
+    # Load cleaned data for calibration and training.
+    cleaned_files = [
+        BASE_DIR / "pi-1-data-clean-5min.csv",
+        BASE_DIR / "pi-2-data-clean-5min.csv",
+    ]
+    cleaned_frames: dict[str, pd.DataFrame] = {}
+    for data_file in cleaned_files:
+        if not data_file.exists():
+            log_info(f"ERROR: {data_file} not found. Exiting.")
+            return
 
-    log_info(f"Loading {data_file}...")
-    pi1_df = pd.read_csv(data_file)
-    log_info(f"  Loaded {len(pi1_df)} rows, {pi1_df.shape[1]} columns")
+        log_info(f"Loading {data_file}...")
+        cleaned_df = pd.read_csv(data_file)
+        cleaned_frames[data_file.name] = cleaned_df
+        log_info(f"  Loaded {len(cleaned_df)} rows, {cleaned_df.shape[1]} columns")
 
-    # Compute observation divisors from data
+    pi1_df = cleaned_frames["pi-1-data-clean-5min.csv"].copy()
+    cal_df = pd.concat(list(cleaned_frames.values()), ignore_index=True)
+
+    # Compute observation normalization constants from the cleaned calibration data.
     log_info("Computing observation normalization constants...")
-    _obs_tvoc = pd.to_numeric(pi1_df["tvoc"], errors="coerce").dropna()
-    _obs_co2 = pd.to_numeric(pi1_df["co2"], errors="coerce").dropna()
-    _obs_temp = pd.to_numeric(pi1_df["temp"], errors="coerce").dropna()
-    _obs_rh = pd.to_numeric(pi1_df["humidity"], errors="coerce").dropna()
+    _obs_tvoc = pd.to_numeric(cal_df["tvoc"], errors="coerce").dropna()
+    _obs_co2 = pd.to_numeric(cal_df["co2"], errors="coerce").dropna()
+    _obs_temp = pd.to_numeric(cal_df["temp"], errors="coerce").dropna()
+    _obs_rh = pd.to_numeric(cal_df["humidity"], errors="coerce").dropna()
 
-    obs_divisors = {
-        "tvoc": float(_obs_tvoc.quantile(0.99)),
-        "co2": float(_obs_co2.quantile(0.99)),
-        "temp": float(_obs_temp.quantile(0.99)),
-        "rh_min": float(_obs_rh.quantile(0.01)),
-        "rh_span": float(_obs_rh.quantile(0.99)) - float(_obs_rh.quantile(0.01)),
-    }
-    log_info(f"  TVOC divisor: {obs_divisors['tvoc']:.2f}")
-    log_info(f"  CO2 divisor: {obs_divisors['co2']:.2f}")
-    log_info(f"  TEMP divisor: {obs_divisors['temp']:.2f}")
-    log_info(
-        f"  RH min: {obs_divisors['rh_min']:.2f}, span: {obs_divisors['rh_span']:.2f}"
+    global TVOC_OBS_DIVISOR, CO2_OBS_DIVISOR, TEMP_OBS_DIVISOR, RH_OBS_MIN, RH_OBS_SPAN
+    TVOC_OBS_DIVISOR = float(_obs_tvoc.quantile(0.99))
+    CO2_OBS_DIVISOR = float(_obs_co2.quantile(0.99))
+    TEMP_OBS_DIVISOR = float(_obs_temp.quantile(0.99))
+    RH_OBS_MIN = float(_obs_rh.quantile(0.01))
+    RH_OBS_SPAN = float(_obs_rh.quantile(0.99)) - RH_OBS_MIN
+
+    log_info(f"  TVOC divisor: {TVOC_OBS_DIVISOR:.2f}")
+    log_info(f"  CO2 divisor: {CO2_OBS_DIVISOR:.2f}")
+    log_info(f"  TEMP divisor: {TEMP_OBS_DIVISOR:.2f}")
+    log_info(f"  RH min: {RH_OBS_MIN:.2f}, span: {RH_OBS_SPAN:.2f}")
+
+    # Reward normalizers from the cleaned calibration data.
+    log_info("Computing reward normalization constants...")
+
+    def one_step_abs_diff(x: pd.Series) -> pd.Series:
+        x = pd.to_numeric(x, errors="coerce").dropna()
+        return x.diff().abs().dropna()
+
+    def positive_excess(x: pd.Series, target: float) -> pd.Series:
+        x = pd.to_numeric(x, errors="coerce").dropna()
+        return (x - target).clip(lower=0.0)
+
+    global \
+        TVOC_PROGRESS_NORM, \
+        TVOC_EXCESS_NORM, \
+        THI_EXCESS_NORM, \
+        RH_EXCESS_NORM, \
+        COLD_EXCESS_NORM
+    TVOC_PROGRESS_NORM = float(one_step_abs_diff(cal_df["tvoc"]).median())
+    TVOC_EXCESS_NORM = float(positive_excess(cal_df["tvoc"], 50.0).quantile(0.75))
+    THI_EXCESS_NORM = float(
+        positive_excess(
+            (0.8 * cal_df["temp"])
+            + ((cal_df["humidity"] / 100.0) * (cal_df["temp"] - 14.4))
+            + 46.4,
+            73.0,
+        ).quantile(0.75)
     )
+    RH_EXCESS_NORM = float(positive_excess(cal_df["humidity"], 90.0).quantile(0.75))
+    COLD_EXCESS_NORM = float(positive_excess(18.0 - cal_df["temp"], 0.0).quantile(0.75))
+
+    log_info(f"  TVOC_PROGRESS_NORM: {TVOC_PROGRESS_NORM:.4f}")
+    log_info(f"  TVOC_EXCESS_NORM: {TVOC_EXCESS_NORM:.4f}")
+    log_info(f"  THI_EXCESS_NORM: {THI_EXCESS_NORM:.4f}")
+    log_info(f"  RH_EXCESS_NORM: {RH_EXCESS_NORM:.4f}")
+    log_info(f"  COLD_EXCESS_NORM: {COLD_EXCESS_NORM:.4f}")
 
     # Build simulator
     log_info("Building simulator...")
@@ -823,7 +857,7 @@ def main():
     log_info("=" * 80)
 
     for algo in algorithms:
-        best_params = tune_hyperparams(algo, sim, run_cfg, obs_divisors)
+        best_params = tune_hyperparams(algo, sim, run_cfg)
         best_params_by_algo[algo] = best_params
 
     # Train on multiple budgets
@@ -836,7 +870,7 @@ def main():
     for algo in algorithms:
         best_params = best_params_by_algo[algo]
         gamma = float(best_params.get("gamma", 0.99))
-        env_cfg = make_env_cfg(sim, gamma=gamma, obs_divisors=obs_divisors)
+        env_cfg = make_env_cfg(sim, gamma=gamma)
 
         for budget in run_cfg.budgets:
             log_info(f"\n[{algo.upper()}] Budget: {budget:,} timesteps")
