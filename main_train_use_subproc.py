@@ -351,8 +351,8 @@ class Pi1SprayEnv(gym.Env):
         self.action_space = spaces.Discrete(len(self.action_to_concentration))
 
         self.observation_space = spaces.Box(
-            low=np.array([0.0, 0.0, 0.0, 0.0, -1.0, -1.0], dtype=np.float32),
-            high=np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+            low=np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            high=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
             dtype=np.float32,
         )
 
@@ -370,16 +370,13 @@ class Pi1SprayEnv(gym.Env):
         self.state = self.sim.reset(t0=start_t).astype(np.float32)
         self.steps_taken = 0
 
-        obs = self._build_obs(self.state, d_tvoc_norm=0.0, d_rh_norm=0.0)
+        obs = self._build_obs(self.state)
         return obs, {}
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
         dose = self.action_to_concentration[int(action)]
         state_prev = self.state.copy()
         next_state = self.sim.step(state_prev, dose, self.t).astype(np.float32)
-
-        d_tvoc_norm = float(np.clip((next_state[0] - state_prev[0]) / 500.0, -1.0, 1.0))
-        d_rh_norm = float(np.clip((next_state[3] - state_prev[3]) / 60.0, -1.0, 1.0))
 
         self.state = next_state
         self.t += 1
@@ -409,17 +406,13 @@ class Pi1SprayEnv(gym.Env):
             "temp": float(self.state[2]),
             "rh": float(self.state[3]),
             "dose": dose,
-            "d_tvoc_norm": d_tvoc_norm,
-            "d_rh_norm": d_rh_norm,
         }
 
-        obs = self._build_obs(self.state, d_tvoc_norm=d_tvoc_norm, d_rh_norm=d_rh_norm)
+        obs = self._build_obs(self.state)
         return obs, reward, terminated, truncated, info
 
-    def _build_obs(
-        self, s: np.ndarray, d_tvoc_norm: float, d_rh_norm: float
-    ) -> np.ndarray:
-        base = np.array(
+    def _build_obs(self, s: np.ndarray) -> np.ndarray:
+        return np.array(
             [
                 s[0] / self.cfg.tvoc_norm_divisor,
                 s[1] / self.cfg.co2_norm_divisor,
@@ -428,8 +421,6 @@ class Pi1SprayEnv(gym.Env):
             ],
             dtype=np.float32,
         )
-        delta = np.array([d_tvoc_norm, d_rh_norm], dtype=np.float32)
-        return np.concatenate([base, delta], axis=0)
 
 
 # ==============================================================================
