@@ -76,6 +76,7 @@ referencing==0.37.0
 rpds-py==0.30.0
 scikit-learn==1.8.0
 scipy==1.17.1
+seaborn==0.13.2
 setuptools==70.2.0
 six==1.17.0
 SQLAlchemy==2.0.49
