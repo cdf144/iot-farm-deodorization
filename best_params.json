@@ -1,0 +1,36 @@
+{
+    "ppo": {
+        "learning_rate": 0.00015292012157885936,
+        "n_steps": 256,
+        "batch_size": 128,
+        "n_epochs": 5,
+        "gamma": 0.9952924732845977,
+        "gae_lambda": 0.9776988454858332,
+        "clip_range": 0.15781185191674718,
+        "ent_coef": 0.005456699991654547,
+        "policy_kwargs": {
+            "net_arch": [
+                128,
+                128
+            ]
+        }
+    },
+    "dqn": {
+        "learning_rate": 9.718319944817387e-05,
+        "buffer_size": 50000,
+        "learning_starts": 10000,
+        "batch_size": 128,
+        "train_freq": 4,
+        "gradient_steps": 1,
+        "target_update_interval": 500,
+        "exploration_fraction": 0.28242441308564326,
+        "exploration_final_eps": 0.08273083416079753,
+        "gamma": 0.9816068474498701,
+        "policy_kwargs": {
+            "net_arch": [
+                256,
+                256
+            ]
+        }
+    }
+}
